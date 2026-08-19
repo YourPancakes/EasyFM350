@@ -15,9 +15,6 @@ public partial class MainWindow
 {
     private readonly DispatcherTimer _reconnectTimer = new();
     private int _disconnectPending;
-    private volatile string? _pdnDns1;
-    private volatile string? _pdnDns2;
-    private volatile string? _pdnIpv6;
     private volatile bool _proxyBusy;
     private bool _proxyWanted;
     private int _reconnectAfterDisconnect;
@@ -28,6 +25,48 @@ public partial class MainWindow
     private string? _upstreamRouteGateway;
     private string? _upstreamRouteIface;
     private string? _upstreamRouteIp;
+
+    private readonly ConnectionState _connection = new();
+
+    private sealed class ConnectionState
+    {
+        public int CgpaddrMiss;
+        public volatile int DataCid;
+        public volatile string? InterfaceName;
+        public volatile int InterfaceIndex;
+        public volatile string? LastInterfaceName;
+        public volatile int LastInterfaceIndex;
+        public volatile string? LastPdnGateway;
+        public volatile string? LastPdnIp;
+        public volatile bool OwnsDataContext;
+        public volatile bool PdnDeactivated;
+        public volatile string? PdnDns1;
+        public volatile string? PdnDns2;
+        public volatile string? PdnGateway;
+        public volatile string? PdnIp;
+        public volatile string? PdnIpv6;
+
+        public void ResetForConnectAttempt()
+        {
+            PdnIp = null;
+            PdnGateway = null;
+            PdnIpv6 = null;
+            InterfaceName = null;
+            InterfaceIndex = 0;
+            DataCid = 0;
+            OwnsDataContext = false;
+            PdnDeactivated = false;
+            CgpaddrMiss = 0;
+        }
+
+        public void ResetRememberedInterface()
+        {
+            LastPdnIp = null;
+            LastPdnGateway = null;
+            LastInterfaceName = null;
+            LastInterfaceIndex = 0;
+        }
+    }
 
     private void UpdatePower()
     {
@@ -106,218 +145,39 @@ public partial class MainWindow
         string proxyHost,
         int proxyPort)
     {
-        _pdnIp = null;
-        _pdnGateway = null;
-        _pdnIpv6 = null;
-        _iface = null;
-        _ifaceIndex = 0;
-        _dataCid = 0;
-        _ownsDataContext = false;
-        _pdnDeact = false;
-        _cgpaddrMiss = 0;
+        _connection.ResetForConnectAttempt();
+
         string? ip = null;
-        string? subnetMask = null;
         string? gateway = null;
         var cid = 0;
         var activatedHere = false;
 
         try
         {
-            var pinReady = false;
-            var pinEmpty = false;
-            var euiccEmpty = false;
-            for (var attempt = 0; attempt < 4 && !pinReady; attempt++)
-            {
-                if (attempt > 0) Thread.Sleep(1500);
-                var pin = _modem.Send("AT+CPIN?");
-                var pinFields = Backend.Modem.Modem.Fields(pin, "+CPIN");
-                pinReady = pinFields.Length > 0 && pinFields[0].Equals("READY", StringComparison.Ordinal);
-                euiccEmpty = pinFields.Length > 0 &&
-                             pinFields[0].Equals("EMPTY_EUICC", StringComparison.OrdinalIgnoreCase);
-                if (euiccEmpty) break;
-                pinEmpty = pin.Length == 0;
-            }
-
-            if (euiccEmpty)
-                throw new InvalidOperationException(
-                    "eSIM has no enabled profile — enable or download one in the eSIM panel");
-            if (!pinReady)
-                throw new InvalidOperationException(pinEmpty ? "CPIN: modem timeout" : "SIM not ready");
-
+            EnsureSimReady();
             WaitForRegistration();
 
-            var context = _settingsService.ResolvePdpForConfiguration(apn, pdp);
-            cid = context.Cid;
-            if (cid < 1) throw new InvalidOperationException("No usable PDP context");
+            var pdpPreparation = PreparePdpContext(apn, pdp, authentication, user, password);
+            cid = pdpPreparation.Cid;
+            activatedHere = ActivatePdpIfNeeded(cid, pdpPreparation.WasActive, apn, pdp);
+            _connection.DataCid = cid;
 
-            var desiredType = PdpProtocol.ToModemValue(pdp);
-            var typeMatches = string.Equals(context.Type ?? string.Empty, desiredType,
-                StringComparison.OrdinalIgnoreCase);
-            var activeMatches = context.IsActive && typeMatches
-                                                 && string.Equals(context.ActiveApn ?? string.Empty, apn,
-                                                     StringComparison.OrdinalIgnoreCase);
-            var configuredMatches = typeMatches
-                                    && string.Equals(context.ConfiguredApn ?? string.Empty, apn,
-                                        StringComparison.OrdinalIgnoreCase);
-            var mustDefine = !activeMatches && !configuredMatches;
+            var operatorName = ReadOperatorName();
+            var network = ReadPdnNetworkInfo(cid);
+            ip = network.Ipv4;
+            gateway = network.Gateway;
 
-            if (mustDefine && context.IsActive)
-                throw new InvalidOperationException("Refusing to redefine an unrelated active PDP context");
+            ConfigureNcmNetwork(network, proxyHost, proxyPort);
+            ValidatePdnAfterConnect(cid);
 
-            if (mustDefine)
-            {
-                var pdpResponse = _modem.Send(ModemCommands.DefinePdp(cid, pdp, apn), 4000);
-                if (!Backend.Modem.Modem.IsOk(pdpResponse))
-                    throw new InvalidOperationException(pdpResponse.Length == 0
-                        ? "CGDCONT: modem timeout"
-                        : "CGDCONT rejected");
-            }
+            _connection.PdnIp = network.Ipv4;
+            _connection.PdnGateway = network.Gateway;
+            _connection.OwnsDataContext = activatedHere;
+            _connection.LastPdnIp = network.Ipv4;
+            _connection.LastPdnGateway = network.Gateway;
+            _connection.LastInterfaceName = _connection.InterfaceName;
+            _connection.LastInterfaceIndex = _connection.InterfaceIndex;
 
-            if (!context.IsActive)
-            {
-                var authenticationResponse = _modem.Send(
-                    ModemCommands.SetAuthentication(cid, authentication, user, password), 4000);
-                if (!Backend.Modem.Modem.IsOk(authenticationResponse))
-                    throw new InvalidOperationException(
-                        authenticationResponse.Length == 0 ? "CGAUTH: modem timeout" : "CGAUTH rejected");
-            }
-
-            if (!context.IsActive)
-            {
-                const int maxActivationAttempts = 3;
-                for (var attempt = 1;; attempt++)
-                {
-                    var activation = _modem.Send(ModemCommands.ActivatePdp(cid, true), 30000, slowCommand: true);
-                    if (Backend.Modem.Modem.IsOk(activation))
-                    {
-                        activatedHere = true;
-                        break;
-                    }
-
-                    if (attempt >= maxActivationAttempts)
-                        throw new InvalidOperationException(
-                            activation.Length == 0 ? "CGACT: modem timeout"
-                            : apn.Length == 0 ? "CGACT rejected (" + activation.Trim() +
-                                                "); empty APN — set the operator APN"
-                            : "CGACT rejected (" + activation.Trim() + ")");
-                    AppendLog("[pdn] CGACT attempt " + attempt + " failed: " + activation.Trim() + " — retrying");
-                    Thread.Sleep(3000);
-                    if (_realExit) throw new OperationCanceledException("Application shutdown.");
-                    if (attempt == maxActivationAttempts - 1)
-                    {
-                        AppendLog("[pdn] re-creating PDP context before the last attempt");
-                        try
-                        {
-                            _modem.Send(ModemCommands.ActivatePdp(cid, false), 10000, true, true);
-                        }
-                        catch (Exception exception)
-                        {
-                            LogError("pdn recovery deactivate: " + exception.Message);
-                        }
-
-                        Thread.Sleep(1000);
-                        try
-                        {
-                            var redefine = _modem.Send(ModemCommands.DefinePdp(cid, pdp, apn), 4000);
-                            if (!Backend.Modem.Modem.IsOk(redefine))
-                                AppendLog("[pdn] context re-create rejected: " + redefine.Trim());
-                        }
-                        catch (Exception exception)
-                        {
-                            LogError("pdn recovery define: " + exception.Message);
-                        }
-                    }
-                }
-            }
-
-            _dataCid = cid;
-
-            string? operatorName = null;
-            var copsFields = Backend.Modem.Modem.Fields(_modem.Send("AT+COPS?"), "+COPS");
-            if (copsFields.Length > 2 && copsFields[2].Length > 0) operatorName = copsFields[2];
-
-            var addressResponse = _modem.Send(ModemCommands.ReadPdpAddress(cid), 4000);
-            var dnsResponse = _modem.Send(ModemCommands.ReadDns(cid), 4000);
-            var dynamicResponse = _modem.Send(ModemCommands.ReadDynamicPdp(cid), 4000);
-
-            PdpContext.TryParseAddresses(addressResponse, cid, out var ipv4, out var ipv6);
-            PdpContext.TryParseDns(dnsResponse, cid, out var primaryDns, out var secondaryDns);
-            if (PdpContext.TryParseIpv4(dynamicResponse, cid, out var ipv4Parameters))
-            {
-                var parameters = ipv4Parameters!;
-                ipv4 ??= parameters.LocalAddress;
-                subnetMask = parameters.SubnetMask;
-                gateway = parameters.Gateway;
-                primaryDns = parameters.PrimaryDns ?? primaryDns;
-                secondaryDns = parameters.SecondaryDns ?? secondaryDns;
-            }
-            else
-            {
-                var active = PdpContext.FindActive(PdpContext.ParseActive(dynamicResponse), cid);
-                ipv4 ??= active?.LocalIpv4;
-                subnetMask ??= active?.LocalIpv4SubnetMask;
-                ipv6 ??= active?.LocalIpv6;
-                gateway ??= active?.GatewayIpv4;
-                primaryDns ??= active?.PrimaryDns;
-                secondaryDns ??= active?.SecondaryDns;
-            }
-
-            if (ipv4 == null && ipv6 == null) throw new InvalidOperationException("PDN active but no IP");
-            _pdnIpv6 = ipv6;
-            if (primaryDns == null && secondaryDns != null)
-            {
-                primaryDns = secondaryDns;
-                secondaryDns = null;
-            }
-
-            _pdnDns1 = primaryDns;
-            _pdnDns2 = secondaryDns;
-
-            if (ipv4 == null)
-                throw new NotSupportedException(
-                    "IPv6-only PDP is active, but Windows NCM IPv6 configuration is not implemented");
-
-            ip = ipv4;
-            if (subnetMask == null || subnetMask == "0.0.0.0")
-            {
-                subnetMask = PdpContext.DefaultIpv4SubnetMask;
-                AppendLog("[pdn] CGCONTRDP: no subnet mask reported — assuming " + subnetMask);
-            }
-
-            if (gateway == null)
-            {
-                gateway = NetConfig.OnLinkGateway;
-                AppendLog("[pdn] CGCONTRDP: no gateway reported — on-link point-to-point routing");
-            }
-
-            _proxy.SetUpstream(proxyHost.Length > 0 && proxyPort > 0 ? proxyHost : null, proxyPort);
-            _iface = NetConfig.FindNcmInterface(out var interfaceIndex);
-            if (_realExit) throw new OperationCanceledException("Application shutdown.");
-            if (_iface == null || interfaceIndex < 1) throw new InvalidOperationException("NCM interface not found");
-            _ifaceIndex = interfaceIndex;
-
-            string applyLog;
-            lock (_netSync)
-            {
-                applyLog = NetConfig.Apply(_iface, ip, subnetMask, gateway, primaryDns, secondaryDns);
-            }
-
-            LogNetConfigOutput(applyLog);
-            if (_realExit) throw new OperationCanceledException("Application shutdown.");
-
-            var check = _modem.Send(ModemCommands.ReadPdpAddress(cid), 3000, true);
-            if (_pdnDeact || check.Length == 0 || !PdpContext.HasUsableAddress(check, cid))
-                throw new InvalidOperationException(check.Length == 0
-                    ? "CGPADDR: modem timeout after connect"
-                    : "PDN dropped during connect");
-
-            _pdnIp = ip;
-            _pdnGateway = gateway;
-            _ownsDataContext = activatedHere;
-            _lastPdnIp = ip;
-            _lastPdnGateway = gateway;
-            _lastIface = _iface;
-            _lastIfaceIndex = interfaceIndex;
             OnUi(() => CompleteConnect(operatorName));
         }
         catch (Exception exception)
@@ -325,6 +185,271 @@ public partial class MainWindow
             RollBackConnect(cid, activatedHere, ip, gateway);
             OnUi(() => FailConnect(exception.Message));
         }
+    }
+
+    private void EnsureSimReady()
+    {
+        var pinReady = false;
+        var pinEmpty = false;
+        var euiccEmpty = false;
+
+        for (var attempt = 0; attempt < 4 && !pinReady; attempt++)
+        {
+            if (attempt > 0) Thread.Sleep(1500);
+
+            var pinResponse = _modem.Send("AT+CPIN?");
+            var pinFields = Backend.Modem.Modem.Fields(pinResponse, "+CPIN");
+            pinReady = pinFields.Length > 0 && pinFields[0].Equals("READY", StringComparison.Ordinal);
+            euiccEmpty = pinFields.Length > 0
+                         && pinFields[0].Equals("EMPTY_EUICC", StringComparison.OrdinalIgnoreCase);
+
+            if (euiccEmpty) break;
+            pinEmpty = pinResponse.Length == 0;
+        }
+
+        if (euiccEmpty)
+            throw new InvalidOperationException(
+                "eSIM has no enabled profile — enable or download one in the eSIM panel");
+        if (!pinReady)
+            throw new InvalidOperationException(pinEmpty ? "CPIN: modem timeout" : "SIM not ready");
+    }
+
+    private (int Cid, bool WasActive) PreparePdpContext(
+        string apn,
+        string pdp,
+        int authentication,
+        string user,
+        string password)
+    {
+        var context = _settingsService.ResolvePdpForConfiguration(apn, pdp);
+        var cid = context.Cid;
+        if (cid < 1) throw new InvalidOperationException("No usable PDP context");
+
+        var desiredType = PdpProtocol.ToModemValue(pdp);
+        var typeMatches = string.Equals(
+            context.Type ?? string.Empty,
+            desiredType,
+            StringComparison.OrdinalIgnoreCase);
+        var activeMatches = context.IsActive
+                            && typeMatches
+                            && string.Equals(
+                                context.ActiveApn ?? string.Empty,
+                                apn,
+                                StringComparison.OrdinalIgnoreCase);
+        var configuredMatches = typeMatches
+                                && string.Equals(
+                                    context.ConfiguredApn ?? string.Empty,
+                                    apn,
+                                    StringComparison.OrdinalIgnoreCase);
+        var mustDefine = !activeMatches && !configuredMatches;
+
+        if (mustDefine && context.IsActive)
+            throw new InvalidOperationException("Refusing to redefine an unrelated active PDP context");
+
+        if (mustDefine)
+        {
+            var defineResponse = _modem.Send(ModemCommands.DefinePdp(cid, pdp, apn), 4000);
+            if (!Backend.Modem.Modem.IsOk(defineResponse))
+                throw new InvalidOperationException(
+                    defineResponse.Length == 0 ? "CGDCONT: modem timeout" : "CGDCONT rejected");
+        }
+
+        if (!context.IsActive)
+        {
+            var authenticationResponse = _modem.Send(
+                ModemCommands.SetAuthentication(cid, authentication, user, password),
+                4000);
+            if (!Backend.Modem.Modem.IsOk(authenticationResponse))
+                throw new InvalidOperationException(
+                    authenticationResponse.Length == 0 ? "CGAUTH: modem timeout" : "CGAUTH rejected");
+        }
+
+        return (cid, context.IsActive);
+    }
+
+    private bool ActivatePdpIfNeeded(int cid, bool wasActive, string apn, string pdp)
+    {
+        if (wasActive) return false;
+
+        const int maxActivationAttempts = 3;
+        for (var attempt = 1;; attempt++)
+        {
+            var activation = _modem.Send(ModemCommands.ActivatePdp(cid, true), 30000, slowCommand: true);
+            if (Backend.Modem.Modem.IsOk(activation)) return true;
+
+            if (attempt >= maxActivationAttempts)
+                throw new InvalidOperationException(
+                    activation.Length == 0 ? "CGACT: modem timeout"
+                    : apn.Length == 0 ? "CGACT rejected (" + activation.Trim()
+                                        + "); empty APN — set the operator APN"
+                    : "CGACT rejected (" + activation.Trim() + ")");
+
+            AppendLog("[pdn] CGACT attempt " + attempt + " failed: " + activation.Trim() + " — retrying");
+            Thread.Sleep(3000);
+            if (_realExit) throw new OperationCanceledException("Application shutdown.");
+
+            if (attempt != maxActivationAttempts - 1) continue;
+
+            AppendLog("[pdn] re-creating PDP context before the last attempt");
+            TryRecoverPdpContext(cid, pdp, apn);
+        }
+    }
+
+    private void TryRecoverPdpContext(int cid, string pdp, string apn)
+    {
+        try
+        {
+            _modem.Send(ModemCommands.ActivatePdp(cid, false), 10000, true, true);
+        }
+        catch (Exception exception)
+        {
+            LogError("pdn recovery deactivate: " + exception.Message);
+        }
+
+        Thread.Sleep(1000);
+
+        try
+        {
+            var redefineResponse = _modem.Send(ModemCommands.DefinePdp(cid, pdp, apn), 4000);
+            if (!Backend.Modem.Modem.IsOk(redefineResponse))
+                AppendLog("[pdn] context re-create rejected: " + redefineResponse.Trim());
+        }
+        catch (Exception exception)
+        {
+            LogError("pdn recovery define: " + exception.Message);
+        }
+    }
+
+    private string? ReadOperatorName()
+    {
+        var operatorFields = Backend.Modem.Modem.Fields(_modem.Send("AT+COPS?"), "+COPS");
+        return operatorFields.Length > 2 && operatorFields[2].Length > 0 ? operatorFields[2] : null;
+    }
+
+    private PdnNetworkInfo ReadPdnNetworkInfo(int cid)
+    {
+        var addressResponse = _modem.Send(ModemCommands.ReadPdpAddress(cid), 4000);
+        var dnsResponse = _modem.Send(ModemCommands.ReadDns(cid), 4000);
+        var dynamicResponse = _modem.Send(ModemCommands.ReadDynamicPdp(cid), 4000);
+
+        PdpContext.TryParseAddresses(addressResponse, cid, out var ipv4, out var ipv6);
+        PdpContext.TryParseDns(dnsResponse, cid, out var primaryDns, out var secondaryDns);
+
+        string? subnetMask = null;
+        string? gateway = null;
+        if (PdpContext.TryParseIpv4(dynamicResponse, cid, out var ipv4Parameters))
+        {
+            var parameters = ipv4Parameters!;
+            ipv4 ??= parameters.LocalAddress;
+            subnetMask = parameters.SubnetMask;
+            gateway = parameters.Gateway;
+            primaryDns = parameters.PrimaryDns ?? primaryDns;
+            secondaryDns = parameters.SecondaryDns ?? secondaryDns;
+        }
+        else
+        {
+            var active = PdpContext.FindActive(PdpContext.ParseActive(dynamicResponse), cid);
+            ipv4 ??= active?.LocalIpv4;
+            subnetMask = active?.LocalIpv4SubnetMask;
+            ipv6 ??= active?.LocalIpv6;
+            gateway = active?.GatewayIpv4;
+            primaryDns ??= active?.PrimaryDns;
+            secondaryDns ??= active?.SecondaryDns;
+        }
+
+        if (ipv4 == null && ipv6 == null) throw new InvalidOperationException("PDN active but no IP");
+
+        _connection.PdnIpv6 = ipv6;
+        if (primaryDns == null && secondaryDns != null)
+        {
+            primaryDns = secondaryDns;
+            secondaryDns = null;
+        }
+
+        _connection.PdnDns1 = primaryDns;
+        _connection.PdnDns2 = secondaryDns;
+
+        if (ipv4 == null)
+            throw new NotSupportedException(
+                "IPv6-only PDP is active, but Windows NCM IPv6 configuration is not implemented");
+
+        if (subnetMask == null || subnetMask == "0.0.0.0")
+        {
+            subnetMask = PdpContext.DefaultIpv4SubnetMask;
+            AppendLog("[pdn] CGCONTRDP: no subnet mask reported — assuming " + subnetMask);
+        }
+
+        if (gateway == null)
+        {
+            gateway = NetConfig.OnLinkGateway;
+            AppendLog("[pdn] CGCONTRDP: no gateway reported — on-link point-to-point routing");
+        }
+
+        return new PdnNetworkInfo(ipv4, ipv6, subnetMask, gateway, primaryDns, secondaryDns);
+    }
+
+    private void ConfigureNcmNetwork(PdnNetworkInfo network, string proxyHost, int proxyPort)
+    {
+        _proxy.SetUpstream(proxyHost.Length > 0 && proxyPort > 0 ? proxyHost : null, proxyPort);
+
+        var interfaceName = NetConfig.FindNcmInterface(out var interfaceIndex);
+        if (_realExit) throw new OperationCanceledException("Application shutdown.");
+        if (interfaceName == null || interfaceIndex < 1)
+            throw new InvalidOperationException("NCM interface not found");
+
+        _connection.InterfaceName = interfaceName;
+        _connection.InterfaceIndex = interfaceIndex;
+
+        string applyLog;
+        lock (_netSync)
+        {
+            applyLog = NetConfig.Apply(
+                interfaceName,
+                network.Ipv4,
+                network.SubnetMask,
+                network.Gateway,
+                network.PrimaryDns,
+                network.SecondaryDns);
+        }
+
+        LogNetConfigOutput(applyLog);
+        if (_realExit) throw new OperationCanceledException("Application shutdown.");
+    }
+
+    private void ValidatePdnAfterConnect(int cid)
+    {
+        var addressResponse = _modem.Send(ModemCommands.ReadPdpAddress(cid), 3000, true);
+        if (_connection.PdnDeactivated
+            || addressResponse.Length == 0
+            || !PdpContext.HasUsableAddress(addressResponse, cid))
+            throw new InvalidOperationException(
+                addressResponse.Length == 0 ? "CGPADDR: modem timeout after connect" : "PDN dropped during connect");
+    }
+
+    private sealed class PdnNetworkInfo
+    {
+        public PdnNetworkInfo(
+            string ipv4,
+            string? ipv6,
+            string subnetMask,
+            string gateway,
+            string? primaryDns,
+            string? secondaryDns)
+        {
+            Ipv4 = ipv4;
+            Ipv6 = ipv6;
+            SubnetMask = subnetMask;
+            Gateway = gateway;
+            PrimaryDns = primaryDns;
+            SecondaryDns = secondaryDns;
+        }
+
+        public string Ipv4 { get; }
+        public string? Ipv6 { get; }
+        public string SubnetMask { get; }
+        public string Gateway { get; }
+        public string? PrimaryDns { get; }
+        public string? SecondaryDns { get; }
     }
 
     private void WaitForRegistration()
@@ -374,10 +499,10 @@ public partial class MainWindow
         TxtConnState.Text = string.Empty;
         FadeIn(TxtConnState);
         TxtConnState.Foreground = _brSuccess;
-        TxtOperIp.Text = (operatorName ?? "?") + " (" + (_pdnIp ?? _pdnIpv6 ?? "?") + ")";
+        TxtOperIp.Text = (operatorName ?? "?") + " (" + (_connection.PdnIp ?? _connection.PdnIpv6 ?? "?") + ")";
         _connActive = true;
-        SwProxy.IsEnabled = _pdnIp != null;
-        SwTun.IsEnabled = _pdnIp != null;
+        SwProxy.IsEnabled = _connection.PdnIp != null;
+        SwTun.IsEnabled = _connection.PdnIp != null;
         UpdateActivityCadence();
         UpdatePower();
         _pollTimer.Stop();
@@ -427,9 +552,9 @@ public partial class MainWindow
 
     private void RollBackConnect(int cid, bool activatedHere, string? ip, string? gateway)
     {
-        var iface = _iface;
-        var dns1 = _pdnDns1;
-        var dns2 = _pdnDns2;
+        var iface = _connection.InterfaceName;
+        var dns1 = _connection.PdnDns1;
+        var dns2 = _connection.PdnDns2;
         if (activatedHere && cid > 0)
             try
             {
@@ -457,15 +582,15 @@ public partial class MainWindow
                 LogError("connect rollback network: " + exception.Message);
             }
 
-        _pdnIp = null;
-        _pdnGateway = null;
-        _pdnIpv6 = null;
-        _pdnDns1 = null;
-        _pdnDns2 = null;
-        _dataCid = 0;
-        _ownsDataContext = false;
-        _iface = null;
-        _ifaceIndex = 0;
+        _connection.PdnIp = null;
+        _connection.PdnGateway = null;
+        _connection.PdnIpv6 = null;
+        _connection.PdnDns1 = null;
+        _connection.PdnDns2 = null;
+        _connection.DataCid = 0;
+        _connection.OwnsDataContext = false;
+        _connection.InterfaceName = null;
+        _connection.InterfaceIndex = 0;
     }
 
     private void OnDisconnect()
@@ -511,20 +636,20 @@ public partial class MainWindow
 
     private void DisconnectWorker()
     {
-        var gateway = _pdnGateway;
-        var cid = _dataCid;
-        var ownsDataContext = _ownsDataContext;
+        var gateway = _connection.PdnGateway;
+        var cid = _connection.DataCid;
+        var ownsDataContext = _connection.OwnsDataContext;
         var wasTunnelEnabled = _tunOn || _tunBusy;
-        var iface = _iface;
-        var dns1 = _pdnDns1;
-        var dns2 = _pdnDns2;
-        _pdnIp = null;
-        _pdnGateway = null;
-        _pdnIpv6 = null;
-        _pdnDns1 = null;
-        _pdnDns2 = null;
-        _dataCid = 0;
-        _ownsDataContext = false;
+        var iface = _connection.InterfaceName;
+        var dns1 = _connection.PdnDns1;
+        var dns2 = _connection.PdnDns2;
+        _connection.PdnIp = null;
+        _connection.PdnGateway = null;
+        _connection.PdnIpv6 = null;
+        _connection.PdnDns1 = null;
+        _connection.PdnDns2 = null;
+        _connection.DataCid = 0;
+        _connection.OwnsDataContext = false;
         var cleanupSucceeded = iface == null;
 
         if (wasTunnelEnabled && iface != null && gateway != null)
@@ -573,12 +698,9 @@ public partial class MainWindow
 
         if (cleanupSucceeded)
         {
-            _iface = null;
-            _ifaceIndex = 0;
-            _lastPdnIp = null;
-            _lastPdnGateway = null;
-            _lastIface = null;
-            _lastIfaceIndex = 0;
+            _connection.InterfaceName = null;
+            _connection.InterfaceIndex = 0;
+            _connection.ResetRememberedInterface();
         }
 
         OnUi(CompleteDisconnect);
@@ -690,27 +812,27 @@ public partial class MainWindow
         if (reason != null) LogError("offline: " + reason);
         if (_proxy.Running) _proxy.Stop();
         if (!_systemProxy.Restore()) LogError("offline: Windows proxy settings could not be restored");
-        var lostIp = _pdnIp;
-        var lostGateway = _pdnGateway;
-        var lostIface = _iface;
-        var lostDns1 = _pdnDns1;
-        var lostDns2 = _pdnDns2;
-        _pdnIp = null;
-        _pdnGateway = null;
-        _pdnIpv6 = null;
-        _pdnDns1 = null;
-        _pdnDns2 = null;
-        _dataCid = 0;
-        _ownsDataContext = false;
+        var lostIp = _connection.PdnIp;
+        var lostGateway = _connection.PdnGateway;
+        var lostIface = _connection.InterfaceName;
+        var lostDns1 = _connection.PdnDns1;
+        var lostDns2 = _connection.PdnDns2;
+        _connection.PdnIp = null;
+        _connection.PdnGateway = null;
+        _connection.PdnIpv6 = null;
+        _connection.PdnDns1 = null;
+        _connection.PdnDns2 = null;
+        _connection.DataCid = 0;
+        _connection.OwnsDataContext = false;
         _tunOn = false;
         _proxyBusy = false;
-        _iface = null;
-        _ifaceIndex = 0;
+        _connection.InterfaceName = null;
+        _connection.InterfaceIndex = 0;
         if (lostIface != null)
         {
-            _lastPdnIp = lostIp;
-            _lastPdnGateway = lostGateway;
-            _lastIface = lostIface;
+            _connection.LastPdnIp = lostIp;
+            _connection.LastPdnGateway = lostGateway;
+            _connection.LastInterfaceName = lostIface;
             _exec.Post(() =>
             {
                 if (_realExit) return;
@@ -724,10 +846,7 @@ public partial class MainWindow
                     }
 
                     LogNetConfigOutput(cleanupLog);
-                    _lastPdnIp = null;
-                    _lastPdnGateway = null;
-                    _lastIface = null;
-                    _lastIfaceIndex = 0;
+                    _connection.ResetRememberedInterface();
                 }
                 catch (Exception ex)
                 {
@@ -774,8 +893,8 @@ public partial class MainWindow
     {
         if (_realExit || !_modem.IsOpen || _pollBusy || (!forceFull && _exec.Pending > 0)) return;
         _pollBusy = true;
-        var cid = _dataCid;
-        var includePdn = cid > 0 && (_pdnIp != null || _pdnIpv6 != null);
+        var cid = _connection.DataCid;
+        var includePdn = cid > 0 && (_connection.PdnIp != null || _connection.PdnIpv6 != null);
         var foreground = IsVisible && !_trayMode && WindowState != WindowState.Minimized &&
                          PageDash.Visibility == Visibility.Visible;
         if (!foreground && !forceFull)
@@ -829,13 +948,13 @@ public partial class MainWindow
 
     private void UpdatePdnHealth(string? response, int cid)
     {
-        if (cid < 1 || cid != _dataCid || string.IsNullOrEmpty(response)) return;
+        if (cid < 1 || cid != _connection.DataCid || string.IsNullOrEmpty(response)) return;
 
         if (PdpContext.TryParseAddresses(response, cid, out var ipv4, out var ipv6))
         {
-            _cgpaddrMiss = 0;
-            var currentIpv4 = _pdnIp;
-            var currentIpv6 = _pdnIpv6;
+            _connection.CgpaddrMiss = 0;
+            var currentIpv4 = _connection.PdnIp;
+            var currentIpv6 = _connection.PdnIpv6;
             var addressChanged = (currentIpv4 != null
                                   && !string.Equals(currentIpv4, ipv4, StringComparison.OrdinalIgnoreCase))
                                  || (currentIpv6 != null
@@ -850,7 +969,7 @@ public partial class MainWindow
             return;
         }
 
-        if (++_cgpaddrMiss >= 2 && (_pdnIp != null || _pdnIpv6 != null))
+        if (++_connection.CgpaddrMiss >= 2 && (_connection.PdnIp != null || _connection.PdnIpv6 != null))
         {
             LogError("pdn lost (cgpaddr) — reconnect");
             RestartConnection();
@@ -874,10 +993,10 @@ public partial class MainWindow
             return;
         }
 
-        var ip = _pdnIp;
-        var gateway = _pdnGateway;
-        var iface = _iface;
-        var interfaceIndex = _ifaceIndex;
+        var ip = _connection.PdnIp;
+        var gateway = _connection.PdnGateway;
+        var iface = _connection.InterfaceName;
+        var interfaceIndex = _connection.InterfaceIndex;
         if (enabled && (ip == null || gateway == null || iface == null || interfaceIndex < 1))
         {
             if (updatePreference) _proxyWanted = false;
@@ -909,7 +1028,7 @@ public partial class MainWindow
             if (enabled)
             {
                 if (_realExit || ip == null || gateway == null || iface == null || interfaceIndex < 1
-                    || _pdnIp != ip || _pdnGateway != gateway || _iface != iface || _ifaceIndex != interfaceIndex)
+                    || _connection.PdnIp != ip || _connection.PdnGateway != gateway || _connection.InterfaceName != iface || _connection.InterfaceIndex != interfaceIndex)
                     throw new OperationCanceledException("PDN changed while starting the proxy.");
 
                 lock (_netSync)
@@ -918,7 +1037,7 @@ public partial class MainWindow
                 }
 
                 AddUpstreamRouteCore(iface, gateway);
-                if (_realExit || _pdnIp != ip || _pdnGateway != gateway || _iface != iface)
+                if (_realExit || _connection.PdnIp != ip || _connection.PdnGateway != gateway || _connection.InterfaceName != iface)
                     throw new OperationCanceledException("PDN changed while starting the proxy.");
 
                 _proxy.Start(0, ip, interfaceIndex);
@@ -1048,8 +1167,8 @@ public partial class MainWindow
         if (!_exec.Post(() =>
             {
                 if (_proxy.Running) return;
-                var iface = _iface;
-                var gateway = _pdnGateway;
+                var iface = _connection.InterfaceName;
+                var gateway = _connection.PdnGateway;
                 try
                 {
                     RemoveUpstreamRouteCore();
@@ -1104,9 +1223,9 @@ public partial class MainWindow
             return;
         }
 
-        var ip = _pdnIp;
-        var gateway = _pdnGateway;
-        var iface = _iface;
+        var ip = _connection.PdnIp;
+        var gateway = _connection.PdnGateway;
+        var iface = _connection.InterfaceName;
         if (enabled && (ip == null || gateway == null || iface == null))
         {
             if (updatePreference) _tunWanted = false;
@@ -1144,7 +1263,7 @@ public partial class MainWindow
             if (_realExit) throw new OperationCanceledException("Application shutdown.");
             if (enabled)
             {
-                if (ip == null || _pdnIp != ip || _pdnGateway != gateway || _iface != iface)
+                if (ip == null || _connection.PdnIp != ip || _connection.PdnGateway != gateway || _connection.InterfaceName != iface)
                     throw new OperationCanceledException("PDN changed while enabling tunnel routing.");
                 string output;
                 lock (_netSync)
@@ -1153,7 +1272,7 @@ public partial class MainWindow
                 }
 
                 LogNetConfigOutput(output);
-                if (_pdnIp != ip || _pdnGateway != gateway || _iface != iface)
+                if (_connection.PdnIp != ip || _connection.PdnGateway != gateway || _connection.InterfaceName != iface)
                 {
                     lock (_netSync)
                     {

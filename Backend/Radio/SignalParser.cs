@@ -10,69 +10,87 @@ internal static partial class SignalParser
     [GeneratedRegex(@"(PCC|SCC \d+):([\d,]+)")]
     private static partial Regex CaRe();
 
-    public static Snapshot Parse(string? rsrpR, string? csqR, string? cellR, string? caR, string? tempR)
+    public static Snapshot Parse(
+        string? rsrpResponse,
+        string? csqResponse,
+        string? cellResponse,
+        string? carrierAggregationResponse,
+        string? temperatureResponse)
     {
-        var s = new Snapshot();
-        if (TryReadIntField(rsrpR, "+RSRP", 0, out var pci)
-            && TryReadIntField(rsrpR, "+RSRP", 1, out var earfcn)
-            && TryReadIntField(rsrpR, "+RSRP", 2, out var rsrp))
+        var snapshot = new Snapshot();
+        if (TryReadIntField(rsrpResponse, "+RSRP", 0, out var pci)
+            && TryReadIntField(rsrpResponse, "+RSRP", 1, out var earfcn)
+            && TryReadIntField(rsrpResponse, "+RSRP", 2, out var rsrp))
         {
-            s.HasSignal = true;
-            s.Pci = pci;
-            s.Earfcn = earfcn;
-            s.Rsrp = rsrp;
-            s.Band = BandPlan.BandFromEarfcn(earfcn);
+            snapshot.HasSignal = true;
+            snapshot.Pci = pci;
+            snapshot.Earfcn = earfcn;
+            snapshot.Rsrp = rsrp;
+            snapshot.Band = BandPlan.BandFromEarfcn(earfcn);
         }
 
-        if (TryReadIntField(csqR, "+CSQ", 0, out var csq)) s.Csq = csq == 99 ? -1 : csq;
+        if (TryReadIntField(csqResponse, "+CSQ", 0, out var csq)) snapshot.Csq = csq == 99 ? -1 : csq;
 
-        if (TryReadField(cellR, "+GTCCINFO", 1, out var rat)
-            && TryReadField(cellR, "+GTCCINFO", 10, out var sinr))
+        if (TryReadField(cellResponse, "+GTCCINFO", 1, out var rat)
+            && TryReadField(cellResponse, "+GTCCINFO", 10, out var sinr))
         {
-            var hasRsrq = TryReadIntField(cellR, "+GTCCINFO", 13, out var rq);
+            var hasRsrq = TryReadIntField(cellResponse, "+GTCCINFO", 13, out var rawRsrq);
             if (rat.SequenceEqual("9"))
             {
-                if (hasRsrq && rq != 255) s.RsrqDb = rq * 0.5 - 43.5;
-                s.SinrIdx = sinr.SequenceEqual("255") ? null : sinr.ToString();
-                if (int.TryParse(sinr, NumberStyles.Integer, CultureInfo.InvariantCulture, out var sv) && sv != 255)
-                    s.SinrDb = sv * 0.5 - 23;
+                if (hasRsrq && rawRsrq != 255) snapshot.RsrqDb = rawRsrq * 0.5 - 43.5;
+                snapshot.SinrIdx = sinr.SequenceEqual("255") ? null : sinr.ToString();
+                if (int.TryParse(sinr, NumberStyles.Integer, CultureInfo.InvariantCulture, out var rawSinr) && rawSinr != 255)
+                    snapshot.SinrDb = rawSinr * 0.5 - 23;
             }
             else if (!rat.SequenceEqual("2"))
             {
-                if (hasRsrq && rq != 255) s.RsrqDb = rq * 0.5 - 19.5;
-                s.SinrIdx = sinr.SequenceEqual("255") ? null : sinr.ToString();
-                if (int.TryParse(sinr, NumberStyles.Integer, CultureInfo.InvariantCulture, out var sv) && sv != 255)
-                    s.SinrDb = sv * 0.5;
+                if (hasRsrq && rawRsrq != 255) snapshot.RsrqDb = rawRsrq * 0.5 - 19.5;
+                snapshot.SinrIdx = sinr.SequenceEqual("255") ? null : sinr.ToString();
+                if (int.TryParse(sinr, NumberStyles.Integer, CultureInfo.InvariantCulture, out var rawSinr) && rawSinr != 255)
+                    snapshot.SinrDb = rawSinr * 0.5;
             }
         }
 
-        if (TryReadField(tempR, "+GTSENRDTEMP", 1, out var temperature)) s.TempC = temperature.ToString();
+        if (TryReadField(temperatureResponse, "+GTSENRDTEMP", 1, out var temperature)) snapshot.TempC = temperature.ToString();
 
-        if (!string.IsNullOrEmpty(caR) && caR.Contains("PCC", StringComparison.Ordinal))
-            foreach (Match x in CaRe().Matches(caR))
+        if (!string.IsNullOrEmpty(carrierAggregationResponse) && carrierAggregationResponse.Contains("PCC", StringComparison.Ordinal))
+            foreach (Match carrierMatch in CaRe().Matches(carrierAggregationResponse))
             {
-                var f = x.Groups[2].Value.Split(',');
-                var isPcc = x.Groups[1].Value == "PCC";
-                if (!isPcc && (f.Length == 0 || f[0] != "2")) continue;
+                var fields = carrierMatch.Groups[2].Value.Split(',');
+                var carrierKind = carrierMatch.Groups[1].Value;
+                var isPrimaryCarrier = carrierKind == "PCC";
+                if (!isPrimaryCarrier && (fields.Length == 0 || fields[0] != "2")) continue;
 
-                var bi = isPcc ? 0 : 2;
-                var ri = isPcc ? 3 : 5;
-                if (f.Length <= Math.Max(bi, ri)
-                    || !int.TryParse(f[bi], NumberStyles.Integer, CultureInfo.InvariantCulture, out var bc)
-                    || !int.TryParse(f[ri], NumberStyles.Integer, CultureInfo.InvariantCulture, out var rb)) continue;
-                if (rb > 0)
-                {
-                    string bl;
-                    if (bc >= 100 && bc < 500) bl = "B" + (bc - 100);
-                    else if (bc >= 501 && bc <= 509) bl = "n" + (bc - 500);
-                    else if (bc >= 5010) bl = "n" + (bc - 5000);
-                    else continue;
-                    var mhz = rb == 6 ? "1.4" : (rb / 5).ToString(CultureInfo.InvariantCulture);
-                    s.Carriers.Add(x.Groups[1].Value + " " + bl + " " + mhz + "MHz");
-                }
+                var bandCodeIndex = isPrimaryCarrier ? 0 : 2;
+                var resourceBlocksIndex = isPrimaryCarrier ? 3 : 5;
+                if (fields.Length <= Math.Max(bandCodeIndex, resourceBlocksIndex)
+                    || !int.TryParse(
+                        fields[bandCodeIndex],
+                        NumberStyles.Integer,
+                        CultureInfo.InvariantCulture,
+                        out var bandCode)
+                    || !int.TryParse(
+                        fields[resourceBlocksIndex],
+                        NumberStyles.Integer,
+                        CultureInfo.InvariantCulture,
+                        out var resourceBlocks))
+                    continue;
+
+                if (resourceBlocks <= 0) continue;
+
+                string bandLabel;
+                if (bandCode >= 100 && bandCode < 500) bandLabel = "B" + (bandCode - 100);
+                else if (bandCode >= 501 && bandCode <= 509) bandLabel = "n" + (bandCode - 500);
+                else if (bandCode >= 5010) bandLabel = "n" + (bandCode - 5000);
+                else continue;
+
+                var bandwidthMhz = resourceBlocks == 6
+                    ? "1.4"
+                    : (resourceBlocks / 5).ToString(CultureInfo.InvariantCulture);
+                snapshot.Carriers.Add(carrierKind + " " + bandLabel + " " + bandwidthMhz + "MHz");
             }
 
-        return s;
+        return snapshot;
     }
 
     private static bool TryReadIntField(string? response, string prefix, int fieldIndex, out int value)

@@ -90,7 +90,7 @@ public partial class MainWindow
                     }
 
                     _simSlot = slot;
-                    _dataCid = 0;
+                    _connection.DataCid = 0;
                     if (pdp != null)
                     {
                         if (pdp.Type != null)

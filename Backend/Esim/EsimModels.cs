@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Text.Json;
 using System.Text.Json.Nodes;
 
 namespace EasyFM350.Wpf.Backend.Esim;
@@ -11,20 +12,8 @@ public sealed class LpacResult
     public JsonNode? Data { get; private set; }
     public bool Ok => Code == 0;
 
-    public string? ErrorDetail
-    {
-        get
-        {
-            try
-            {
-                return Data is JsonValue value && value.TryGetValue<string>(out var detail) ? detail : null;
-            }
-            catch
-            {
-                return null;
-            }
-        }
-    }
+    public string? ErrorDetail =>
+        Data is JsonValue value && value.TryGetValue<string>(out var detail) ? detail : null;
 
     public static LpacResult Error(string message)
     {
@@ -43,7 +32,7 @@ public sealed class LpacResult
         {
             root = JsonNode.Parse(line);
         }
-        catch
+        catch (JsonException)
         {
             return null;
         }
@@ -77,13 +66,9 @@ public sealed class EsimChipInfo
         var euiccInfo2 = data["EUICCInfo2"];
         info.ProfileVersion = (string?)euiccInfo2?["profileVersion"];
         info.Firmware = (string?)euiccInfo2?["euiccFirmwareVer"];
-        try
-        {
-            info.FreeMemory = (long?)euiccInfo2?["extCardResource"]?["freeNonVolatileMemory"];
-        }
-        catch
-        {
-        }
+        if (euiccInfo2?["extCardResource"]?["freeNonVolatileMemory"] is JsonValue freeMemory
+            && freeMemory.TryGetValue<long>(out var freeMemoryBytes))
+            info.FreeMemory = freeMemoryBytes;
 
         return info;
     }

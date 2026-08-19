@@ -412,141 +412,39 @@ public sealed class ProxyEngine
         Socket? remote = null;
         try
         {
-            var ns = client.GetStream();
-            var firstRead = await ReadHeadAsync(ns, 16384, false, null).ConfigureAwait(false);
-            var head = firstRead.Head;
-            var extra = firstRead.Extra;
-            if (head.Length == 0)
+            var clientStream = client.GetStream();
+            var firstRead = await ReadHeadAsync(clientStream, 16384, false, null).ConfigureAwait(false);
+            if (firstRead.Head.Length == 0) return;
+
+            if (firstRead.Head[0] == 0x05)
             {
-                client.Close();
-                return;
-            }
-
-            if (head[0] == 0x05)
-            {
-                if (head.Length < 2 || head[1] == 0 || !OfferedNoAuth(head))
-                {
-                    await TryWriteAsync(ns, SocksNoAccept).ConfigureAwait(false);
-                    client.Close();
-                    return;
-                }
-
-                await WriteWithTimeoutAsync(ns, SocksGreetOk).ConfigureAwait(false);
-
-                var requestRead = await ReadHeadAsync(ns, 262 + 260, true, extra).ConfigureAwait(false);
-                var req = requestRead.Head;
-                var reqExtra = requestRead.Extra;
-                if (!TryParseSocksTarget(req, out var host, out var port))
-                {
-                    await SendSocksFailAsync(ns).ConfigureAwait(false);
-                    client.Close();
-                    return;
-                }
-
-                byte[] early;
-                try
-                {
-                    var connected = await ConnectTargetAsync(host, port).ConfigureAwait(false);
-                    remote = connected.Socket;
-                    early = connected.Early;
-                }
-                catch
-                {
-                    await SendSocksFailAsync(ns).ConfigureAwait(false);
-                    throw;
-                }
-
-                await WriteWithTimeoutAsync(ns, BuildSocksGranted(remote)).ConfigureAwait(false);
-                if (early.Length > 0) await WriteWithTimeoutAsync(ns, early).ConfigureAwait(false);
-                if (reqExtra.Length > 0)
-                    using (var es = new NetworkStream(remote, false))
-                    {
-                        await WriteWithTimeoutAsync(es, reqExtra).ConfigureAwait(false);
-                    }
+                remote = await HandleSocks5Async(clientStream, firstRead.Head, firstRead.Extra).ConfigureAwait(false);
             }
             else
             {
-                var text = Latin1.GetString(head);
-                var sp = text.IndexOf(' ');
-                var sp2 = sp > 0 ? text.IndexOf(' ', sp + 1) : -1;
-                if (sp <= 0 || sp2 < 0)
+                var request = Latin1.GetString(firstRead.Head);
+                if (!TryParseHttpRequestLine(request, out var method, out var firstSpace, out var secondSpace)) return;
+
+                if (method.Equals("CONNECT", StringComparison.Ordinal))
                 {
-                    client.Close();
-                    return;
-                }
-
-                var method = text.Substring(0, sp).ToUpperInvariant();
-                if (method == "CONNECT")
-                {
-                    var target = text.Substring(sp + 1, sp2 - sp - 1);
-                    if (!TryParseAuthority(target, 443, out var host, out var port))
-                    {
-                        client.Close();
-                        return;
-                    }
-
-                    byte[] early;
-                    try
-                    {
-                        var connected = await ConnectTargetAsync(host, port).ConfigureAwait(false);
-                        remote = connected.Socket;
-                        early = connected.Early;
-                    }
-                    catch
-                    {
-                        await SendHttp502Async(ns).ConfigureAwait(false);
-                        client.Close();
-                        return;
-                    }
-
-                    await WriteWithTimeoutAsync(ns, HttpOkEstablished).ConfigureAwait(false);
-                    if (early.Length > 0) await WriteWithTimeoutAsync(ns, early).ConfigureAwait(false);
-                    if (extra.Length > 0)
-                        using (var es = new NetworkStream(remote, false))
-                        {
-                            await WriteWithTimeoutAsync(es, extra).ConfigureAwait(false);
-                        }
+                    remote = await HandleHttpConnectAsync(
+                            clientStream,
+                            request,
+                            firstSpace,
+                            secondSpace,
+                            firstRead.Extra)
+                        .ConfigureAwait(false);
                 }
                 else
                 {
-                    if (!TryParseHttpTarget(text, sp, sp2, out var host, out var port, out var originTarget,
-                            out var authority))
-                    {
-                        await TryWriteAsync(ns, HttpBadRequest).ConfigureAwait(false);
-                        client.Close();
-                        return;
-                    }
-
-                    var upstream = _upstream;
-                    if (!TryBuildForwardRequest(
-                            text, sp, sp2, originTarget, authority, upstream != null,
-                            out var forwardRequest, out var requestBodyLength))
-                    {
-                        await TryWriteAsync(ns, HttpBadRequest).ConfigureAwait(false);
-                        client.Close();
-                        return;
-                    }
-
-                    try
-                    {
-                        remote = upstream == null
-                            ? await ConnectViaAsync(host, port).ConfigureAwait(false)
-                            : await ConnectViaAsync(upstream.Host, upstream.Port).ConfigureAwait(false);
-                    }
-                    catch
-                    {
-                        await SendHttp502Async(ns).ConfigureAwait(false);
-                        client.Close();
-                        return;
-                    }
-
-                    using (var rs = new NetworkStream(remote, false))
-                    {
-                        await WriteWithTimeoutAsync(rs, Latin1.GetBytes(forwardRequest)).ConfigureAwait(false);
-                    }
-
-                    await ForwardHttpExchangeAsync(
-                        client.Client, remote, extra, requestBodyLength).ConfigureAwait(false);
+                    await HandleHttpForwardAsync(
+                            client.Client,
+                            clientStream,
+                            request,
+                            firstSpace,
+                            secondSpace,
+                            firstRead.Extra)
+                        .ConfigureAwait(false);
                     return;
                 }
             }
@@ -574,6 +472,207 @@ public sealed class ProxyEngine
             {
             }
         }
+    }
+
+    private async Task<Socket?> HandleSocks5Async(Stream clientStream, byte[] greeting, byte[] greetingExtra)
+    {
+        if (greeting.Length < 2 || greeting[1] == 0 || !OfferedNoAuth(greeting))
+        {
+            await TryWriteAsync(clientStream, SocksNoAccept).ConfigureAwait(false);
+            return null;
+        }
+
+        await WriteWithTimeoutAsync(clientStream, SocksGreetOk).ConfigureAwait(false);
+
+        var requestRead = await ReadHeadAsync(clientStream, 522, true, greetingExtra).ConfigureAwait(false);
+        if (!TryParseSocksTarget(requestRead.Head, out var host, out var port))
+        {
+            await SendSocksFailAsync(clientStream).ConfigureAwait(false);
+            return null;
+        }
+
+        Socket remote;
+        byte[] upstreamEarlyData;
+        try
+        {
+            var connected = await ConnectTargetAsync(host, port).ConfigureAwait(false);
+            remote = connected.Socket;
+            upstreamEarlyData = connected.Early;
+        }
+        catch
+        {
+            await SendSocksFailAsync(clientStream).ConfigureAwait(false);
+            throw;
+        }
+
+        try
+        {
+            await WriteWithTimeoutAsync(clientStream, BuildSocksGranted(remote)).ConfigureAwait(false);
+            if (upstreamEarlyData.Length > 0)
+                await WriteWithTimeoutAsync(clientStream, upstreamEarlyData).ConfigureAwait(false);
+
+            if (requestRead.Extra.Length > 0)
+            {
+                using var remoteStream = new NetworkStream(remote, false);
+                await WriteWithTimeoutAsync(remoteStream, requestRead.Extra).ConfigureAwait(false);
+            }
+
+            return remote;
+        }
+        catch
+        {
+            try
+            {
+                remote.Close();
+            }
+            catch
+            {
+            }
+
+            throw;
+        }
+    }
+
+    private async Task<Socket?> HandleHttpConnectAsync(
+        Stream clientStream,
+        string request,
+        int firstSpace,
+        int secondSpace,
+        byte[] clientEarlyData)
+    {
+        var target = request.Substring(firstSpace + 1, secondSpace - firstSpace - 1);
+        if (!TryParseAuthority(target, 443, out var host, out var port)) return null;
+
+        Socket remote;
+        byte[] upstreamEarlyData;
+        try
+        {
+            var connected = await ConnectTargetAsync(host, port).ConfigureAwait(false);
+            remote = connected.Socket;
+            upstreamEarlyData = connected.Early;
+        }
+        catch
+        {
+            await SendHttp502Async(clientStream).ConfigureAwait(false);
+            return null;
+        }
+
+        try
+        {
+            await WriteWithTimeoutAsync(clientStream, HttpOkEstablished).ConfigureAwait(false);
+            if (upstreamEarlyData.Length > 0)
+                await WriteWithTimeoutAsync(clientStream, upstreamEarlyData).ConfigureAwait(false);
+
+            if (clientEarlyData.Length > 0)
+            {
+                using var remoteStream = new NetworkStream(remote, false);
+                await WriteWithTimeoutAsync(remoteStream, clientEarlyData).ConfigureAwait(false);
+            }
+
+            return remote;
+        }
+        catch
+        {
+            try
+            {
+                remote.Close();
+            }
+            catch
+            {
+            }
+
+            throw;
+        }
+    }
+
+    private async Task HandleHttpForwardAsync(
+        Socket clientSocket,
+        Stream clientStream,
+        string request,
+        int firstSpace,
+        int secondSpace,
+        byte[] initialBody)
+    {
+        if (!TryParseHttpTarget(
+                request,
+                firstSpace,
+                secondSpace,
+                out var host,
+                out var port,
+                out var originTarget,
+                out var authority))
+        {
+            await TryWriteAsync(clientStream, HttpBadRequest).ConfigureAwait(false);
+            return;
+        }
+
+        var upstream = _upstream;
+        if (!TryBuildForwardRequest(
+                request,
+                firstSpace,
+                secondSpace,
+                originTarget,
+                authority,
+                upstream != null,
+                out var forwardRequest,
+                out var requestBodyLength))
+        {
+            await TryWriteAsync(clientStream, HttpBadRequest).ConfigureAwait(false);
+            return;
+        }
+
+        Socket remote;
+        try
+        {
+            remote = upstream == null
+                ? await ConnectViaAsync(host, port).ConfigureAwait(false)
+                : await ConnectViaAsync(upstream.Host, upstream.Port).ConfigureAwait(false);
+        }
+        catch
+        {
+            await SendHttp502Async(clientStream).ConfigureAwait(false);
+            return;
+        }
+
+        try
+        {
+            using (var remoteStream = new NetworkStream(remote, false))
+            {
+                await WriteWithTimeoutAsync(remoteStream, Latin1.GetBytes(forwardRequest)).ConfigureAwait(false);
+            }
+
+            await ForwardHttpExchangeAsync(
+                    clientSocket,
+                    remote,
+                    initialBody,
+                    requestBodyLength)
+                .ConfigureAwait(false);
+        }
+        finally
+        {
+            try
+            {
+                remote.Close();
+            }
+            catch
+            {
+            }
+        }
+    }
+
+    private static bool TryParseHttpRequestLine(
+        string request,
+        out string method,
+        out int firstSpace,
+        out int secondSpace)
+    {
+        method = string.Empty;
+        firstSpace = request.IndexOf(' ');
+        secondSpace = firstSpace > 0 ? request.IndexOf(' ', firstSpace + 1) : -1;
+        if (firstSpace <= 0 || secondSpace < 0) return false;
+
+        method = request.Substring(0, firstSpace).ToUpperInvariant();
+        return true;
     }
 
     private static Task SendSocksFailAsync(Stream stream)
@@ -678,17 +777,61 @@ public sealed class ProxyEngine
     {
         forwardRequest = string.Empty;
         requestBodyLength = 0;
+
         var requestLineEnd = request.IndexOf("\r\n", StringComparison.Ordinal);
         if (requestLineEnd <= secondSpace || !request.EndsWith("\r\n\r\n", StringComparison.Ordinal)) return false;
-
         if (!IsHttpToken(request.Substring(0, firstSpace))) return false;
-        var version = request.Substring(secondSpace + 1, requestLineEnd - secondSpace - 1);
-        if (!version.Equals("HTTP/1.1", StringComparison.Ordinal)
-            && !version.Equals("HTTP/1.0", StringComparison.Ordinal)) return false;
 
-        var headers = new List<(string Name, string Value)>();
-        var connectionTokens = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var hostCount = 0;
+        var version = request.Substring(secondSpace + 1, requestLineEnd - secondSpace - 1);
+        if (!IsSupportedHttpVersion(version)) return false;
+
+        if (!TryParseForwardHeaders(
+                request,
+                requestLineEnd,
+                out var headers,
+                out var connectionTokens,
+                out var hostCount))
+            return false;
+
+        if (hostCount > 1 || (version == "HTTP/1.1" && hostCount != 1)) return false;
+        if (connectionTokens.Contains("Host")
+            || connectionTokens.Contains("Content-Length")
+            || connectionTokens.Contains("Transfer-Encoding"))
+            return false;
+
+        if (!TryGetRequestBodyLength(headers, out requestBodyLength)) return false;
+
+        var target = absoluteForm
+            ? request.Substring(firstSpace + 1, secondSpace - firstSpace - 1)
+            : originTarget;
+        forwardRequest = BuildForwardRequest(
+            request,
+            firstSpace,
+            target,
+            version,
+            authority,
+            headers,
+            connectionTokens);
+        return true;
+    }
+
+    private static bool IsSupportedHttpVersion(string version)
+    {
+        return version.Equals("HTTP/1.1", StringComparison.Ordinal)
+               || version.Equals("HTTP/1.0", StringComparison.Ordinal);
+    }
+
+    private static bool TryParseForwardHeaders(
+        string request,
+        int requestLineEnd,
+        out List<(string Name, string Value)> headers,
+        out HashSet<string> connectionTokens,
+        out int hostCount)
+    {
+        headers = new List<(string Name, string Value)>();
+        connectionTokens = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        hostCount = 0;
+
         var cursor = requestLineEnd + 2;
         var headersEnd = request.Length - 2;
         while (cursor < headersEnd)
@@ -700,87 +843,133 @@ public sealed class ProxyEngine
 
             var colon = request.IndexOf(':', cursor, end - cursor);
             if (colon <= cursor) return false;
+
             var name = request.Substring(cursor, colon - cursor);
             if (!IsHttpToken(name)) return false;
+
             var value = request.Substring(colon + 1, end - colon - 1).Trim(' ', '\t');
-            foreach (var character in value)
-                if ((character < 0x20 && character != '\t') || character == 0x7f)
-                    return false;
+            if (!IsValidHttpHeaderValue(value)) return false;
+
             headers.Add((name, value));
             if (name.Equals("Host", StringComparison.OrdinalIgnoreCase)) hostCount++;
-            if (name.Equals("Connection", StringComparison.OrdinalIgnoreCase))
-                foreach (var token in value.Split(','))
-                {
-                    var option = token.Trim();
-                    if (option.Length == 0 || !IsHttpToken(option)) return false;
-                    connectionTokens.Add(option);
-                }
+            if (name.Equals("Connection", StringComparison.OrdinalIgnoreCase)
+                && !TryAddConnectionTokens(value, connectionTokens))
+                return false;
 
             cursor = end + 2;
         }
 
-        if (hostCount > 1 || (version == "HTTP/1.1" && hostCount != 1)) return false;
-        if (connectionTokens.Contains("Host")
-            || connectionTokens.Contains("Content-Length")
-            || connectionTokens.Contains("Transfer-Encoding")) return false;
+        return true;
+    }
 
+    private static bool IsValidHttpHeaderValue(string value)
+    {
+        foreach (var character in value)
+            if ((character < 0x20 && character != '\t') || character == 0x7f)
+                return false;
+        return true;
+    }
+
+    private static bool TryAddConnectionTokens(string value, HashSet<string> connectionTokens)
+    {
+        foreach (var token in value.Split(','))
+        {
+            var option = token.Trim();
+            if (option.Length == 0 || !IsHttpToken(option)) return false;
+            connectionTokens.Add(option);
+        }
+
+        return true;
+    }
+
+    private static bool TryGetRequestBodyLength(
+        List<(string Name, string Value)> headers,
+        out long requestBodyLength)
+    {
+        requestBodyLength = 0;
         var transferEncoding = false;
         var contentLengths = new List<long>();
+
         foreach (var header in headers)
+        {
             if (header.Name.Equals("Transfer-Encoding", StringComparison.OrdinalIgnoreCase))
             {
                 if (transferEncoding) return false;
+
                 var codings = header.Value.Split(',');
                 if (codings.Length == 0
-                    || !codings[^1].Trim().Equals("chunked", StringComparison.OrdinalIgnoreCase)) return false;
+                    || !codings[^1].Trim().Equals("chunked", StringComparison.OrdinalIgnoreCase))
+                    return false;
                 transferEncoding = true;
-            }
-            else if (header.Name.Equals("Content-Length", StringComparison.OrdinalIgnoreCase))
-            {
-                foreach (var item in header.Value.Split(','))
-                {
-                    if (!long.TryParse(item.Trim(), NumberStyles.None,
-                            CultureInfo.InvariantCulture, out var length) || length < 0) return false;
-                    contentLengths.Add(length);
-                }
+                continue;
             }
 
-        if (contentLengths.Count > 1)
-        {
-            var length = contentLengths[0];
-            for (var index = 1; index < contentLengths.Count; index++)
-                if (contentLengths[index] != length)
+            if (!header.Name.Equals("Content-Length", StringComparison.OrdinalIgnoreCase)) continue;
+
+            foreach (var item in header.Value.Split(','))
+            {
+                if (!long.TryParse(
+                        item.Trim(),
+                        NumberStyles.None,
+                        CultureInfo.InvariantCulture,
+                        out var length)
+                    || length < 0)
                     return false;
+                contentLengths.Add(length);
+            }
         }
 
         if (transferEncoding) return false;
+        if (!AllContentLengthsMatch(contentLengths)) return false;
         if (contentLengths.Count > 0) requestBodyLength = contentLengths[0];
+        return true;
+    }
 
-        var target = absoluteForm
-            ? request.Substring(firstSpace + 1, secondSpace - firstSpace - 1)
-            : originTarget;
+    private static bool AllContentLengthsMatch(List<long> contentLengths)
+    {
+        if (contentLengths.Count <= 1) return true;
+
+        var expectedLength = contentLengths[0];
+        for (var index = 1; index < contentLengths.Count; index++)
+            if (contentLengths[index] != expectedLength)
+                return false;
+        return true;
+    }
+
+    private static string BuildForwardRequest(
+        string request,
+        int firstSpace,
+        string target,
+        string version,
+        string authority,
+        List<(string Name, string Value)> headers,
+        HashSet<string> connectionTokens)
+    {
         var builder = new StringBuilder(request.Length + 32);
         builder.Append(request, 0, firstSpace + 1).Append(target).Append(' ').Append(version).Append("\r\n");
         builder.Append("Host: ").Append(authority).Append("\r\n");
 
         foreach (var header in headers)
         {
-            if (header.Name.Equals("Host", StringComparison.OrdinalIgnoreCase)
-                || header.Name.Equals("Connection", StringComparison.OrdinalIgnoreCase)
-                || header.Name.Equals("Proxy-Connection", StringComparison.OrdinalIgnoreCase)
-                || header.Name.Equals("Keep-Alive", StringComparison.OrdinalIgnoreCase)
-                || header.Name.Equals("TE", StringComparison.OrdinalIgnoreCase)
-                || header.Name.Equals("Trailer", StringComparison.OrdinalIgnoreCase)
-                || header.Name.Equals("Upgrade", StringComparison.OrdinalIgnoreCase)
-                || header.Name.Equals("Proxy-Authorization", StringComparison.OrdinalIgnoreCase)
-                || connectionTokens.Contains(header.Name))
-                continue;
+            if (ShouldRemoveForwardHeader(header.Name, connectionTokens)) continue;
             builder.Append(header.Name).Append(": ").Append(header.Value).Append("\r\n");
         }
 
         builder.Append("Connection: close\r\n\r\n");
-        forwardRequest = builder.ToString();
-        return true;
+        return builder.ToString();
+    }
+
+    private static bool ShouldRemoveForwardHeader(string name, HashSet<string> connectionTokens)
+    {
+        return name.Equals("Host", StringComparison.OrdinalIgnoreCase)
+               || name.Equals("Connection", StringComparison.OrdinalIgnoreCase)
+               || name.Equals("Proxy-Connection", StringComparison.OrdinalIgnoreCase)
+               || name.Equals("Keep-Alive", StringComparison.OrdinalIgnoreCase)
+               || name.Equals("TE", StringComparison.OrdinalIgnoreCase)
+               || name.Equals("Trailer", StringComparison.OrdinalIgnoreCase)
+               || name.Equals("Upgrade", StringComparison.OrdinalIgnoreCase)
+               || name.Equals("Proxy-Authorization", StringComparison.OrdinalIgnoreCase)
+               || connectionTokens.Contains(name);
     }
 
     private static bool IsHttpToken(string value)

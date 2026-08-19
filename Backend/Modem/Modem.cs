@@ -177,131 +177,201 @@ public partial class Modem
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(cmd);
         if (timeoutMs < 1) throw new ArgumentOutOfRangeException(nameof(timeoutMs));
+
         var lost = false;
+        string response;
         lock (_sync)
         {
-            ITransport? t;
-            lock (_stateSync)
-            {
-                t = _t;
-            }
-
-            if (t == null || !t.IsOpen) throw new InvalidOperationException("port closed");
+            var transport = GetOpenTransport();
             try
             {
-                var pre = t.ReadAvailable();
-                if (pre.Length > 0) RouteUrcs(pre);
-
-                t.Write(cmd + "\r");
-                if (!quiet) Log(">> " + CgAuthMask().Replace(cmd, "$1\"***\",\"***\""));
-                var sb = _rxBuf;
-                sb.Length = 0;
-                if (sb.Capacity > 65536) sb.Capacity = 4096;
-                var deadline = Environment.TickCount64 + timeoutMs;
-                var lastNl = -1;
-                Span<char> tailSt = stackalloc char[256];
-                while (Volatile.Read(ref _closeRequested) == 0 && Environment.TickCount64 < deadline)
-                {
-                    var chunk = t.ReadAvailable();
-                    if (chunk.Length > 0)
-                    {
-                        var prevLen = sb.Length;
-                        sb.Append(chunk);
-                        if (sb.Length > MaxResponseChars)
-                        {
-                            var remove = sb.Length - MaxResponseChars;
-                            sb.Remove(0, remove);
-                            lastNl = Math.Max(-1, lastNl - remove);
-                            prevLen = Math.Max(0, prevLen - remove);
-                        }
-
-                        var scanFrom = lastNl + 1;
-                        if (sb.Length - scanFrom > 4096) scanFrom = sb.Length - 4096;
-                        var nl = chunk.LastIndexOf('\n');
-                        if (nl >= 0) lastNl = Math.Min(sb.Length - 1, prevLen + nl);
-
-                        var tailLen = sb.Length - scanFrom;
-                        bool matched;
-                        if (tailLen <= 256)
-                        {
-                            var st = tailSt.Slice(0, tailLen);
-                            sb.CopyTo(scanFrom, st, tailLen);
-                            matched = FinalCode().IsMatch(st);
-                        }
-                        else
-                        {
-                            var scanBuf = ArrayPool<char>.Shared.Rent(tailLen);
-                            try
-                            {
-                                sb.CopyTo(scanFrom, scanBuf, 0, tailLen);
-                                matched = FinalCode().IsMatch(new ReadOnlySpan<char>(scanBuf, 0, tailLen));
-                            }
-                            finally
-                            {
-                                ArrayPool<char>.Shared.Return(scanBuf);
-                            }
-                        }
-
-                        if (matched)
-                        {
-                            if (!PrepareCorrelatedResponse(sb, cmd))
-                            {
-                                lastNl = LastIndexOf(sb, '\n');
-                                continue;
-                            }
-
-                            List<string> urcs;
-                            var cleaned = ResponseCleaner.Clean(sb.ToString(), cmd, out urcs);
-                            if (!quiet) Log("<< " + cleaned.Trim());
-                            foreach (var u in urcs) FireUrc(u);
-
-                            var tail = t.ReadAvailable();
-                            if (tail.Length > 0) RouteUrcs(tail);
-                            _consecutiveTimeouts = 0;
-                            return cleaned;
-                        }
-                    }
-
-                    Thread.Sleep(20);
-                }
-
-                if (Volatile.Read(ref _closeRequested) != 0) return string.Empty;
-
-                var partial = sb.ToString();
-                if (partial.Length > 0) RouteUrcs(partial);
-                Log("<< (timeout) " + partial.Trim());
-
-                if (!slowCommand && ++_consecutiveTimeouts >= MaxTimeouts)
-                {
-                    Log("!!! modem silent x" + _consecutiveTimeouts + " — считаю порт мёртвым");
-                    lost = true;
-                }
+                response = ExecuteCommand(transport, cmd, timeoutMs, quiet, slowCommand, out lost);
             }
-            catch (Exception ex)
+            catch (Exception ex) when (IsTransportFailure(ex))
             {
-                if (!(ex is IOException || ex is TimeoutException || ex is UnauthorizedAccessException ||
-                      ex is InvalidOperationException || ex is ObjectDisposedException))
-                    throw;
                 Log("!!! io: " + ex.Message);
                 lost = true;
+                response = string.Empty;
             }
         }
 
-        if (lost)
+        if (lost) HandleLostPort();
+        return response;
+    }
+
+    private ITransport GetOpenTransport()
+    {
+        ITransport? transport;
+        lock (_stateSync)
         {
-            var wasOpen = CurrentPort != null;
-            try
-            {
-                Close();
-            }
-            catch
-            {
-            }
-
-            if (wasOpen) EventDispatch.Invoke(OnPortLost, ex => Log("!!! portlost subscriber: " + ex.Message));
+            transport = _t;
         }
 
-        return "";
+        if (transport == null || !transport.IsOpen) throw new InvalidOperationException("port closed");
+        return transport;
+    }
+
+    private string ExecuteCommand(
+        ITransport transport,
+        string command,
+        int timeoutMs,
+        bool quiet,
+        bool slowCommand,
+        out bool lost)
+    {
+        lost = false;
+
+        var pendingInput = transport.ReadAvailable();
+        if (pendingInput.Length > 0) RouteUrcs(pendingInput);
+
+        transport.Write(command + "\r");
+        if (!quiet) Log(">> " + CgAuthMask().Replace(command, "$1\"***\",\"***\""));
+
+        var responseBuffer = _rxBuf;
+        responseBuffer.Length = 0;
+        if (responseBuffer.Capacity > 65536) responseBuffer.Capacity = 4096;
+
+        var deadline = Environment.TickCount64 + timeoutMs;
+        var lastNewline = -1;
+        Span<char> stackTail = stackalloc char[256];
+
+        while (Volatile.Read(ref _closeRequested) == 0 && Environment.TickCount64 < deadline)
+        {
+            var chunk = transport.ReadAvailable();
+            if (chunk.Length > 0)
+            {
+                if (TryCompleteResponse(
+                        transport,
+                        command,
+                        quiet,
+                        chunk,
+                        responseBuffer,
+                        stackTail,
+                        ref lastNewline,
+                        out var retryImmediately,
+                        out var completedResponse))
+                    return completedResponse;
+
+                if (retryImmediately) continue;
+            }
+
+            Thread.Sleep(20);
+        }
+
+        if (Volatile.Read(ref _closeRequested) != 0) return string.Empty;
+
+        var partialResponse = responseBuffer.ToString();
+        if (partialResponse.Length > 0) RouteUrcs(partialResponse);
+        Log("<< (timeout) " + partialResponse.Trim());
+
+        if (!slowCommand && ++_consecutiveTimeouts >= MaxTimeouts)
+        {
+            Log("!!! modem silent x" + _consecutiveTimeouts + " — считаю порт мёртвым");
+            lost = true;
+        }
+
+        return string.Empty;
+    }
+
+    private bool TryCompleteResponse(
+        ITransport transport,
+        string command,
+        bool quiet,
+        string chunk,
+        StringBuilder responseBuffer,
+        Span<char> stackTail,
+        ref int lastNewline,
+        out bool retryImmediately,
+        out string completedResponse)
+    {
+        retryImmediately = false;
+        completedResponse = string.Empty;
+
+        var previousLength = responseBuffer.Length;
+        responseBuffer.Append(chunk);
+        TrimResponseBuffer(responseBuffer, ref previousLength, ref lastNewline);
+
+        var scanFrom = lastNewline + 1;
+        if (responseBuffer.Length - scanFrom > 4096) scanFrom = responseBuffer.Length - 4096;
+
+        var newlineInChunk = chunk.LastIndexOf('\n');
+        if (newlineInChunk >= 0)
+            lastNewline = Math.Min(responseBuffer.Length - 1, previousLength + newlineInChunk);
+
+        if (!HasFinalCode(responseBuffer, scanFrom, stackTail)) return false;
+
+        if (!PrepareCorrelatedResponse(responseBuffer, command))
+        {
+            lastNewline = LastIndexOf(responseBuffer, '\n');
+            retryImmediately = true;
+            return false;
+        }
+
+        var cleanedResponse = ResponseCleaner.Clean(responseBuffer.ToString(), command, out var urcs);
+        if (!quiet) Log("<< " + cleanedResponse.Trim());
+        foreach (var urc in urcs) FireUrc(urc);
+
+        var trailingInput = transport.ReadAvailable();
+        if (trailingInput.Length > 0) RouteUrcs(trailingInput);
+
+        _consecutiveTimeouts = 0;
+        completedResponse = cleanedResponse;
+        return true;
+    }
+
+    private static void TrimResponseBuffer(StringBuilder responseBuffer, ref int previousLength, ref int lastNewline)
+    {
+        if (responseBuffer.Length <= MaxResponseChars) return;
+
+        var removeCount = responseBuffer.Length - MaxResponseChars;
+        responseBuffer.Remove(0, removeCount);
+        lastNewline = Math.Max(-1, lastNewline - removeCount);
+        previousLength = Math.Max(0, previousLength - removeCount);
+    }
+
+    private static bool HasFinalCode(StringBuilder responseBuffer, int scanFrom, Span<char> stackTail)
+    {
+        var tailLength = responseBuffer.Length - scanFrom;
+        if (tailLength <= stackTail.Length)
+        {
+            var tail = stackTail.Slice(0, tailLength);
+            responseBuffer.CopyTo(scanFrom, tail, tailLength);
+            return FinalCode().IsMatch(tail);
+        }
+
+        var rentedTail = ArrayPool<char>.Shared.Rent(tailLength);
+        try
+        {
+            responseBuffer.CopyTo(scanFrom, rentedTail, 0, tailLength);
+            return FinalCode().IsMatch(new ReadOnlySpan<char>(rentedTail, 0, tailLength));
+        }
+        finally
+        {
+            ArrayPool<char>.Shared.Return(rentedTail);
+        }
+    }
+
+    private static bool IsTransportFailure(Exception exception)
+    {
+        return exception is IOException
+            or TimeoutException
+            or UnauthorizedAccessException
+            or InvalidOperationException
+            or ObjectDisposedException;
+    }
+
+    private void HandleLostPort()
+    {
+        var wasOpen = CurrentPort != null;
+        try
+        {
+            Close();
+        }
+        catch
+        {
+        }
+
+        if (wasOpen) EventDispatch.Invoke(OnPortLost, ex => Log("!!! portlost subscriber: " + ex.Message));
     }
 
     private static int LastIndexOf(StringBuilder builder, char value)

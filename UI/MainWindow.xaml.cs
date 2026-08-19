@@ -46,25 +46,13 @@ public partial class MainWindow : Window
     private readonly SystemProxySettings _systemProxy = new();
     private readonly DispatcherTimer _watchTimer = new();
     private int _apnReadPending;
-    private int _cgpaddrMiss;
 
     private bool _connActive;
     private volatile bool _connBusy;
-    private volatile int _dataCid;
-    private volatile string? _iface;
-    private volatile int _ifaceIndex;
     private volatile bool _infoBusyFlag;
-    private volatile string? _lastIface;
-    private volatile int _lastIfaceIndex;
-    private volatile string? _lastPdnGateway;
-    private volatile string? _lastPdnIp;
     private Backend.Radio.SignalParser.Snapshot? _lastSignal;
     private string? _lastTempC;
-    private volatile bool _ownsDataContext;
-    private volatile bool _pdnDeact;
-    private volatile string? _pdnGateway;
 
-    private volatile string? _pdnIp;
     private volatile bool _pollBusy;
     private int _tempTick;
     private NotifyIcon? _tray;
@@ -167,12 +155,12 @@ public partial class MainWindow : Window
         if (!message.StartsWith("+CGEV", StringComparison.Ordinal)
             || !PdpContext.TryParsePdnDeactivationCid(message, out var cid)) return;
 
-        var activeCid = _dataCid;
+        var activeCid = _connection.DataCid;
         if (activeCid < 1 || cid != activeCid) return;
-        _pdnDeact = true;
+        _connection.PdnDeactivated = true;
         OnUi(() =>
         {
-            if (_dataCid == cid && (_pdnIp != null || _pdnIpv6 != null)) RestartConnection();
+            if (_connection.DataCid == cid && (_connection.PdnIp != null || _connection.PdnIpv6 != null)) RestartConnection();
         });
     }
 
@@ -436,8 +424,8 @@ public partial class MainWindow : Window
 
         try
         {
-            var cid = _dataCid;
-            if (_ownsDataContext && cid > 0 && _modem.IsOpen)
+            var cid = _connection.DataCid;
+            if (_connection.OwnsDataContext && cid > 0 && _modem.IsOpen)
             {
                 var response = _modem.Send(
                     ModemCommands.ActivatePdp(cid, false),
@@ -447,7 +435,7 @@ public partial class MainWindow : Window
                     LogError("exit PDN: deactivate rejected or timed out");
             }
 
-            _ownsDataContext = false;
+            _connection.OwnsDataContext = false;
         }
         catch (Exception ex)
         {
@@ -456,8 +444,8 @@ public partial class MainWindow : Window
 
         try
         {
-            var gateway = _pdnGateway ?? _lastPdnGateway;
-            var iface = _iface ?? _lastIface;
+            var gateway = _connection.PdnGateway ?? _connection.LastPdnGateway;
+            var iface = _connection.InterfaceName ?? _connection.LastInterfaceName;
 
             if (Monitor.TryEnter(_netSync, TimeSpan.FromSeconds(_sessionEnd ? 3 : 20)))
             {
@@ -486,7 +474,7 @@ public partial class MainWindow : Window
                     if (iface != null)
                         try
                         {
-                            NetConfig.Cleanup(iface, gateway, _pdnDns1, _pdnDns2, 3000);
+                            NetConfig.Cleanup(iface, gateway, _connection.PdnDns1, _connection.PdnDns2, 3000);
                         }
                         catch (Exception ex2)
                         {
@@ -559,8 +547,8 @@ public partial class MainWindow : Window
         {
         }
 
-        var gateway = _pdnGateway ?? _lastPdnGateway;
-        var iface = _iface ?? _lastIface;
+        var gateway = _connection.PdnGateway ?? _connection.LastPdnGateway;
+        var iface = _connection.InterfaceName ?? _connection.LastInterfaceName;
         if (iface == null) return;
         if (Monitor.TryEnter(_netSync, TimeSpan.FromSeconds(3)))
             try
@@ -584,7 +572,7 @@ public partial class MainWindow : Window
 
                 try
                 {
-                    NetConfig.Cleanup(iface, gateway, _pdnDns1, _pdnDns2, 3000);
+                    NetConfig.Cleanup(iface, gateway, _connection.PdnDns1, _connection.PdnDns2, 3000);
                 }
                 catch
                 {
