@@ -1,0 +1,7 @@
+bin/
+obj/
+.vs/
+publish/
+/EasyFM350-*-win-x64.exe
+*.user
+/EasyFM350_refactored_checked.zip

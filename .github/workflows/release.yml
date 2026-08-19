@@ -1,0 +1,28 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - name: Tests gate
+        run: dotnet run --project tests -c Release
+      - name: Publish single-file exe
+        run: dotnet publish EasyFM350.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:DebugType=none -p:DebugSymbols=false -o publish
+      - name: Rename
+        run: Copy-Item publish\EasyFM350.exe "EasyFM350-${{ github.ref_name }}-win-x64.exe"
+      - name: Upload to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          files: EasyFM350-${{ github.ref_name }}-win-x64.exe
+          generate_release_notes: true
